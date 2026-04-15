@@ -29,8 +29,11 @@ def get_data_batch(args, data):
 def compute_grad(args, model,
                  data_batch,
                  v=None,
-                 second_order_grads=False):
-    criterion = nn.MSELoss().to(args.device)
+                 second_order_grads=False,
+                 criterion=None):
+    if criterion is None:
+        criterion = nn.MSELoss().to(args.device)
+        
     x, y = data_batch
     if second_order_grads:
         frz_model_params = copy.deepcopy(model.state_dict())
@@ -83,7 +86,7 @@ def get_loss(args, model, datas):
     return np.mean(losses)
 
 
-def train(args, model, ind, round):
+def train(args, model, ind, round, dataset=None):
     """
     Client training.
 
@@ -91,35 +94,47 @@ def train(args, model, ind, round):
     :param model: server model
     :param ind: client id
     :param round: round
+    :param dataset: client dataset (TensorDataset)
     :return: client model after training
     """
     model.train()
-    Dtr, _ = nn_seq_wind(model.name, args.B)
-    model.len = len(Dtr)
+    
+    if dataset is not None:
+        from torch.utils.data import DataLoader
+        loader = DataLoader(dataset, batch_size=args.B, shuffle=True)
+        Dtr = [batch for batch in loader]
+        model.len = len(dataset)
+    else:
+        Dtr, _ = nn_seq_wind(model.name, args.B)
+        model.len = len(Dtr)
+        Dtr = [x for x in iter(Dtr)]
+    
     # print('training...')
-    model.train()
-    model.len = len(Dtr)
-    print('training...')
-    Dtr = [x for x in iter(Dtr)]
-    for epoch in tqdm(range(args.E)):
+    
+    # Determine loss function
+    criterion = nn.CrossEntropyLoss().to(args.device) if dataset is not None else nn.MSELoss().to(args.device)
+
+    for epoch in range(args.E):
         temp_model = copy.deepcopy(model)
         data_batch_1 = get_data_batch(args, Dtr)
-        grads = compute_grad(args, temp_model, data_batch_1)
+        grads = compute_grad(args, temp_model, data_batch_1, criterion=criterion)
         for param, grad in zip(temp_model.parameters(), grads):
             param.data.sub_(args.alpha * grad)
 
         data_batch_2 = get_data_batch(args, Dtr)
-        grads_1st = compute_grad(args, temp_model, data_batch_2)
+        grads_1st = compute_grad(args, temp_model, data_batch_2, criterion=criterion)
 
         data_batch_3 = get_data_batch(args, Dtr)
 
         grads_2nd = compute_grad(args,
                                  model, data_batch_3,
-                                 v=grads_1st, second_order_grads=True)
+                                 v=grads_1st, second_order_grads=True, criterion=criterion)
         for param, grad1, grad2 in zip(
                 model.parameters(), grads_1st, grads_2nd
         ):
             param.data.sub_(args.beta * grad1 - args.beta * args.alpha * grad2)
+
+    return model
 
         train_loss = get_loss(args, model, Dtr)
         print('round {:02d} epoch {:03d} train_loss {:.8f}'.format(
@@ -239,18 +254,28 @@ def train(args, model, ind, round):
 #     return hessian_params
 
 
-def local_adaptation(args, model):
+def local_adaptation(args, model, dataset=None):
     """
     Adaptive training.
 
     :param args:hyperparameters
     :param model: federated global model
+    :param dataset: client dataset
     :return:final model after adaptive training
     """
     model.train()
-    Dtr, Dte = nn_seq_wind(model.name, 50)
+    if dataset is not None:
+        from torch.utils.data import DataLoader
+        # Split dataset into train/test for adaptation?
+        # Or use full dataset for adaptation?
+        # Usually adaptation uses a support set.
+        # Let's assume dataset passed here is the support set (train split).
+        Dtr = DataLoader(dataset, batch_size=50, shuffle=True)
+    else:
+        Dtr, Dte = nn_seq_wind(model.name, 50)
+        
     optimizer = torch.optim.Adam(model.parameters(), lr=args.alpha)
-    loss_function = nn.MSELoss().to(args.device)
+    loss_function = nn.CrossEntropyLoss().to(args.device) if dataset is not None else nn.MSELoss().to(args.device)
     loss = 0
     # one step
     for epoch in range(args.local_epochs):
@@ -267,9 +292,14 @@ def local_adaptation(args, model):
     return model
 
 
-def test(args, ann):
+def test(args, ann, dataset=None):
     ann.eval()
-    Dtr, Dte = nn_seq_wind(ann.name, args.B)
+    if dataset is not None:
+        from torch.utils.data import DataLoader
+        Dte = DataLoader(dataset, batch_size=args.B, shuffle=False)
+    else:
+        Dtr, Dte = nn_seq_wind(ann.name, args.B)
+        
     pred = []
     y = []
     for (seq, target) in tqdm(Dte):
